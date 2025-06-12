@@ -1,133 +1,189 @@
-import numpy as np
-import pandas as pd
+import os
+import psutil
+import numpy as np, pandas as pd
 from typing import Tuple
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 
 lr_types = {
-    'exp': lambda epoch, lr_initial, decay_rate: lr_initial * np.exp(-decay_rate * epoch),
-    'step': lambda epoch, lr_initial, decay_rate: lr_initial * (0.5 ** (epoch // 10)),
-    'const': lambda epoch, lr_initial, decay_rate: lr_initial
+    'exp': lambda epoch, lr0, decay: lr0 * np.exp(-decay * epoch),
+    'step': lambda epoch, lr0, decay: lr0 * 0.5 ** (epoch // 10),
+    'const': lambda epoch, lr0, decay: lr0
 }
 
-def calc_gradient(X, y, w, reg_type=None, alpha=0.0001, l1_ratio=0.3):
-    eps = 0.05
-    term = X.dot(w) - y
-    term_abs = np.abs(term)
-    grad_coef = np.where(term_abs <= eps, term, eps * np.sign(term))
-    grad = X.T.dot(grad_coef) / X.shape[0]
+
+def calc_gradient(X, y, w, reg_type=None, alpha=0.1, l1_ratio=0.5):
+    grad = X.T @ (X @ w - y) / X.shape[0]
+
+    w_reg = w.copy()
+    w_reg[0] = 0.0
 
     if reg_type == 'l1':
-        grad += alpha * np.sign(w)
+        grad += alpha * np.sign(w_reg)
     elif reg_type == 'l2':
-        grad += alpha * w
+        grad += 2 * alpha * w_reg
     elif reg_type == 'elasticnet':
-        grad += alpha * (l1_ratio * np.sign(w) + (1 - l1_ratio) * w)
-
+        grad += alpha * (l1_ratio * np.sign(w_reg) +
+                         (1 - l1_ratio) * 2 * w_reg)
     return grad
 
-def calc_loss(X, y, w, reg_type=None, alpha=0.0001, l1_ratio=0.3):
-    mse = np.mean((X.dot(w) - y) ** 2)
+
+def calc_loss(X, y, w, reg_type=None, alpha=0.1, l1_ratio=0.5):
+    mse = np.mean((X @ w - y) ** 2)
+
+    w_reg = w.copy()
+    w_reg[0] = 0.0
 
     if reg_type == 'l1':
-        reg_term = alpha * np.sum(np.abs(w))
+        reg = alpha * np.sum(np.abs(w_reg))
     elif reg_type == 'l2':
-        reg_term = alpha * np.sum(w ** 2)
-    elif reg_type == 'elastic':
-        reg_term = alpha * (l1_ratio * np.sum(np.abs(w)) + (1 - l1_ratio) * np.sum(w ** 2))
+        reg = alpha * np.sum(w_reg ** 2)
+    elif reg_type == 'elasticnet':
+        reg = alpha * (l1_ratio * np.sum(np.abs(w_reg)) +
+                       (1 - l1_ratio) * np.sum(w_reg ** 2))
     else:
-        reg_term = 0
-
-    return mse + reg_term
-
+        reg = 0.0
+    return mse + reg
 
 
-def stochastic_gradient_descent(X, y, lr_function, learning_rate=0.01, n_epochs=500, batch_size=1, decay_rate=0.1, eps=0.4, momentum=0.6):
-    m, n_features = X.shape
-    theta = np.random.randn(n_features, 1)
-    loss_history = []
+def sgd(
+        X, y,
+        lr_fun,
+        lr0=0.01,
+        n_epochs=800,
+        batch=1,
+        decay=0.003,
+        momentum=0.9,
+        reg_type='elasticnet',
+        tol=1e-4,
+        patience=20,
+        log_every=1
+):
+    m, n = X.shape
+    w = np.zeros((n, 1))
+    v = np.zeros_like(w)
 
-    velocity = np.zeros_like(theta)
+    loss_hist, iter_hist = [], []
+    best_loss, wait, it = np.inf, 0, 0
 
-    for epoch in range(n_epochs):
-        current_lr = lr_function(epoch, learning_rate, decay_rate)
-        indices = np.random.permutation(m)
-        X_shuffled = X[indices]
-        y_shuffled = y[indices]
+    for epoch in range(1, n_epochs + 1):
+        lr = lr_fun(epoch - 1, lr0, decay)
+        perm = np.random.permutation(m)
 
-        for i in range(0, m, batch_size):
-            xi = X_shuffled[i:i + batch_size]
-            yi = y_shuffled[i:i + batch_size]
-            gradients = calc_gradient(xi, yi, theta)
-            velocity = momentum * velocity - current_lr * gradients
-            theta += velocity
+        for i in range(0, m, batch):
+            xi = X[perm[i:i + batch]]
+            yi = y[perm[i:i + batch]]
 
-        loss = calc_loss(X, y, theta)
-        loss_history.append(loss)
+            g = calc_gradient(xi, yi, w, reg_type)
+            v = momentum * v - lr * g
+            w += v
+            it += 1
 
-        if loss <= eps:
-            return loss_history, epoch, theta
+            if it % log_every == 0:
+                cur_loss = calc_loss(X, y, w, reg_type)
+                loss_hist.append(cur_loss)
+                iter_hist.append(it)
 
-    return loss_history, n_epochs, theta
+                if best_loss - cur_loss > tol:
+                    best_loss = cur_loss
+                    wait = 0
+                else:
+                    wait += 1
+                    if wait >= patience:
+                        return w, iter_hist, loss_hist
+    return w, iter_hist, loss_hist
 
-def load_data(file_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    df = pd.read_csv(file_path, delimiter=';')
+
+def load_data(fp: str
+              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    df = pd.read_csv(fp, sep=';')
     X = df.drop('quality', axis=1).values
-    y = df['quality'].values.reshape(-1, 1)
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5, random_state=42)
-
+    y = df['quality'].to_numpy().reshape(-1, 1)
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    X_tr = scaler.fit_transform(X_tr)
+    X_te = scaler.transform(X_te)
+    X_tr = np.c_[np.ones((X_tr.shape[0], 1)), X_tr]
+    X_te = np.c_[np.ones((X_te.shape[0], 1)), X_te]
+    return X_tr, X_te, y_tr, y_te
 
-    X_train = np.c_[np.ones(X_train.shape[0]), X_train]
-    X_test = np.c_[np.ones(X_test.shape[0]), X_test]
 
-    return X_train, X_test, y_train, y_test
+def train(lr_name, lr_fun):
+    proc = psutil.Process(os.getpid())
+    mem_before = proc.memory_info().rss
 
-def test_model(X_test: np.ndarray, y_test: np.ndarray, theta: np.ndarray) -> dict:
-    y_pred = X_test @ theta
-    mse = calc_loss(X_test, y_test, theta)
-    mae = np.mean(np.abs(y_test - y_pred))
-    r2 = 1 - np.sum((y_test - y_pred) ** 2) / np.sum((y_test - np.mean(y_test)) ** 2)
-
-    return {
-        "MSE": mse,
-        "MAE": mae,
-        "R2": r2,
-        "Predicted": y_pred.flatten(),
-        "True": y_test.flatten()
-    }
-
-def train_and_test_model(lr_function, learning_rate=0.03, n_epochs=1500, batch_size=1, decay_rate=0.005, eps=0.01):
-    X_train, X_test, y_train, y_test = load_data('dataset.csv')
-    loss_history, epochs, theta = stochastic_gradient_descent(
-        X_train, y_train, lr_function, learning_rate,
-        n_epochs, batch_size, decay_rate, eps
+    Xtr, Xte, ytr, yte = load_data('dataset.csv')
+    w, its, loss = sgd(
+        Xtr, ytr, lr_fun,
+        lr0=0.01, n_epochs=800, batch=100,
+        decay=0.003, momentum=0.3, reg_type='l2',
+        tol=1e-4, patience=20
     )
 
-    metrics = test_model(X_test, y_test, theta)
-    print("\nMetrics:")
-    print(f"MSE: {metrics['MSE']:.4f}")
-    print(f"MAE: {metrics['MAE']:.4f}")
-    print(f"R2: {metrics['R2']:.4f}")
+    mem_after = proc.memory_info().rss
+    delta_mb = (mem_after - mem_before) / 1024 ** 2
+    total_iters = its[-1]
 
-    true = np.random.uniform(3, 8, 100)
-    pred = true + np.random.normal(0, 0.5, 100)
+    y_pred = Xte @ w
+    mse = np.mean((yte - y_pred) ** 2)
+    mae = np.mean(np.abs(yte - y_pred))
+    r2 = 1 - np.sum((yte - y_pred) ** 2) / np.sum((yte - yte.mean()) ** 2)
 
-    plt.figure(figsize=(10, 6))
-    plt.scatter(true, pred, alpha=0.6)
-    plt.plot([3, 8], [3, 8], 'r--', label='Ideal Prediction')
-    plt.xlabel('True Quality (Expert Score)')
-    plt.ylabel('Predicted Quality')
-    plt.title('Wine Quality Prediction Performance\nMAE=0.52, R²=0.34')
-    plt.grid(True)
-    plt.legend()
+    print(f"{lr_name.upper():>5}  "
+          f"MSE={mse:.3f}  MAE={mae:.3f}  R²={r2:.3f}  "
+          f"iters={total_iters:,}  ΔRAM={delta_mb:.1f} MiB")
+    print(f"{lr_name.upper():>5}  "
+          f"{total_iters:,} & {delta_mb:.1f} & {mse:.3f} & {mae:.3f} & {r2:.3f}")
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    plt.subplots_adjust(bottom=0.22)
+    current = {'view': 'loss'}
+
+    def draw_loss():
+        ax.clear()
+        ax.set_aspect('auto', adjustable='box')
+        ax.plot(its, loss)
+        ax.set_xlabel('iter');
+        ax.set_ylabel('loss')
+        ax.set_title('Loss vs iteration')
+        ax.grid(True)
+        ax.set_xlim(0, its[-1])
+        ax.relim();
+        ax.autoscale_view()
+        fig.canvas.draw_idle()
+
+    def draw_scatter():
+        ax.clear()
+        ax.scatter(yte, y_pred, alpha=0.6)
+        lo, hi = 3, 8
+        ax.plot([lo, hi], [lo, hi], 'r--')
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlim(lo - .2, hi + .2)
+        ax.set_ylim(lo - .2, hi + .2)
+        ax.set_xlabel('True')
+        ax.set_ylabel('Predicted')
+        ax.set_title(f"True vs Pred  (MSE={mse:.2f}, MAE={mae:.2f}, R²={r2:.2f})")
+        ax.grid(True)
+        fig.canvas.draw_idle()
+
+    btn_ax = plt.axes([0.4, 0.05, 0.2, 0.075])
+    btn = Button(btn_ax, 'switch')
+
+    def toggle(event):
+        if current['view'] == 'loss':
+            draw_scatter();
+            current['view'] = 'scatter'
+        else:
+            draw_loss();
+            current['view'] = 'loss'
+
+    btn.on_clicked(toggle)
+    draw_loss()
     plt.show()
 
-if __name__ == "__main__":
-    for lr_name, lr_function in lr_types.items():
-        print(f"\nTraining with {lr_name} learning rate:")
-        train_and_test_model(lr_function)
+
+if __name__ == '__main__':
+    for name, fun in lr_types.items():
+        train(name, fun)
